@@ -38,8 +38,8 @@ InstallDir ""
 ShowInstDetails show
 ShowUninstDetails show
 BrandingText "[bmux]"
-Icon "${SourceDir}/assets/bmux.ico"
-UninstallIcon "${SourceDir}/assets/bmux.ico"
+Icon "${SourceDir}\assets\bmux.ico"
+UninstallIcon "${SourceDir}\assets\bmux.ico"
 VIProductVersion "${AppNumericVersion}"
 VIAddVersionKey /LANG=1033 "ProductName" "[bmux]"
 VIAddVersionKey /LANG=1033 "FileDescription" "Bmux installer"
@@ -47,8 +47,8 @@ VIAddVersionKey /LANG=1033 "ProductVersion" "${AppVersion}"
 VIAddVersionKey /LANG=1033 "FileVersion" "${AppVersion}"
 VIAddVersionKey /LANG=1033 "LegalCopyright" "See THIRD_PARTY_NOTICES.md"
 
-!define MUI_ICON "${SourceDir}/assets/bmux.ico"
-!define MUI_UNICON "${SourceDir}/assets/bmux.ico"
+!define MUI_ICON "${SourceDir}\assets\bmux.ico"
+!define MUI_UNICON "${SourceDir}\assets\bmux.ico"
 !define MUI_ABORTWARNING
 !define MUI_WELCOMEPAGE_TEXT "Install [bmux] for your Windows account.$\r$\n$\r$\nClose bmux before installing an update. Existing workspaces, settings, and transcripts will be kept.$\r$\n$\r$\nRequires 64-bit Windows 10 version 1809 or newer."
 !insertmacro MUI_PAGE_WELCOME
@@ -95,18 +95,18 @@ Section "Bmux (required)" AppSection
     MessageBox MB_ICONSTOP|MB_OK "Could not replace bmux.exe. Close bmux and run the installer again." /SD IDOK
     Abort
   ${EndIf}
-  File "${SourceDir}/README.md"
-  File "${SourceDir}/THIRD_PARTY_NOTICES.md"
-  File /oname=RUN_WINDOWS.txt "${SourceDir}/packaging/WINDOWS.txt"
+  File "${SourceDir}\README.md"
+  File "${SourceDir}\THIRD_PARTY_NOTICES.md"
+  File /oname=RUN_WINDOWS.txt "${SourceDir}\packaging\WINDOWS.txt"
   SetOutPath "$INSTDIR\assets"
-  File "${SourceDir}/assets/bmux.ico"
-  File "${SourceDir}/assets/themes.LICENSE"
-  File "${SourceDir}/assets/themes.source.json"
+  File "${SourceDir}\assets\bmux.ico"
+  File "${SourceDir}\assets\themes.LICENSE"
+  File "${SourceDir}\assets\themes.source.json"
   SetOutPath "$INSTDIR\Assets\Fonts"
-  File "${SourceDir}/Assets/Fonts/OFL.txt"
+  File "${SourceDir}\Assets\Fonts\OFL.txt"
   SetOutPath "$INSTDIR\docs"
-  File "${SourceDir}/docs/PORTING.md"
-  File "${SourceDir}/docs/VALIDATION.md"
+  File "${SourceDir}\docs\PORTING.md"
+  File "${SourceDir}\docs\VALIDATION.md"
   SetOutPath "$INSTDIR"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   ${If} ${Errors}
