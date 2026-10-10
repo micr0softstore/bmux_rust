@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=[bmux]
+GenericName=Terminal Emulator
+Comment=A calm, workspace-oriented terminal
+Exec=bmux
+TryExec=bmux
+Icon=dev.bmux.app
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=shell;terminal;workspace;ssh;tmux;
+StartupNotify=true
+StartupWMClass=dev.bmux.app

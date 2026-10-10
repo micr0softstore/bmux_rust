@@ -1,0 +1,56 @@
+name: Rust desktop
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libx11-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev tmux dpkg-dev binutils python3 python3-pil desktop-file-utils
+      - name: Install NSIS
+        if: runner.os == 'Windows'
+        run: choco install nsis --yes --no-progress
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --all-targets --locked
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        run: |
+          sh packaging/package-linux.sh
+          ./packaging/build-deb.sh
+          dpkg-deb --info dist/*.deb
+          desktop-file-validate packaging/dev.bmux.app.desktop
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        run: |
+          ./packaging/package-windows.ps1
+          ./packaging/build-windows-installer.ps1
+      - name: Verify Windows installation, upgrade, and removal
+        if: runner.os == 'Windows'
+        run: ./packaging/test-windows-installer.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bmux-${{ runner.os }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.deb
+            dist/*-setup.exe
+          if-no-files-found: error

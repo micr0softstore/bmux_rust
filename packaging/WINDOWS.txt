@@ -1,0 +1,40 @@
+[bmux] for Windows
+
+Installer: run bmux-<version>-windows-x86_64-setup.exe. It installs for your
+current account in %LOCALAPPDATA%\Programs\Bmux, without administrator
+rights, and adds Start Menu shortcuts. A desktop shortcut is optional.
+Close bmux before updating; rerunning an installer updates the same folder.
+Remove it through Windows Settings > Apps, or the Start Menu uninstaller.
+Uninstalling keeps your settings, workspaces, and transcripts.
+
+Portable ZIP: extract the ZIP, then double-click bmux.exe. No installation
+is needed. The ZIP and installed app use the same user data by default.
+
+Use an x86_64 Windows 10 version 1809 or newer, or Windows 11, computer
+with an OpenGL-capable graphics driver. The application starts a native
+PowerShell terminal.
+
+Use the + menu for workspaces, Ctrl+Shift+T for a new terminal tab, and
+Ctrl+Shift+D / Ctrl+Shift+E for right / down splits. Settings opens with
+Ctrl+Shift+Comma. Ordinary Ctrl+C remains the terminal's interrupt shortcut.
+
+SSH workspaces need Windows OpenSSH Client (ssh.exe on PATH) and tmux on
+the remote host. Local tmux workspaces need WSL with tmux installed in its
+default Linux distribution. Ordinary Windows shell workspaces need neither.
+
+Settings and workspaces are saved in %LOCALAPPDATA%\Bmux. Set BMUX_DATA_DIR
+before launching to use a separate directory. Fonts and the app icon are
+embedded in bmux.exe.
+
+To build the installer, install Rust, Visual Studio C++ Build Tools with
+the Windows SDK, and NSIS 3 (https://nsis.sourceforge.io/Download), then run:
+
+  powershell -ExecutionPolicy Bypass -File .\packaging\build-windows-installer.ps1
+
+The script builds the MSVC x64 release with a static C runtime and writes
+the installer to dist\. Use -NsisPath to specify makensis.exe if needed.
+-SkipBuild packages an existing release; -BinaryPath can select its path.
+A prebuilt executable must have its runtime dependencies already satisfied.
+
+README.md has all shortcuts. docs/PORTING.md describes platform differences
+and the remaining differences from the original macOS application.

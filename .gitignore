@@ -1,0 +1,20 @@
+# macOS Finder droppings
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Editor / tooling
+.vscode/
+.idea/
+*.swp
+*~
+
+# Environment / secrets
+.env
+.env.local
+
+# Rust builds and release packages
+/target/
+/dist/
+__pycache__/
