@@ -113,6 +113,123 @@ struct CellPos {
     col: u16,
 }
 
+/// Hyperlink advertised by the application (OSC 8), attributed to the cells
+/// between the opening and closing sequences via the cursor positions seen
+/// when each boundary arrived. Positions go stale when the grid reflows, so
+/// spans are dropped on resize, clear and explicit scrolling; plain-text URL
+/// detection always re-scans the live cells instead.
+#[derive(Clone, Debug)]
+struct Hyperlink {
+    uri: String,
+    start_row: u16,
+    start_col: u16,
+    end_row: u16,
+    end_col: u16,
+}
+
+impl Hyperlink {
+    fn covers(&self, cell: CellPos) -> bool {
+        if cell.row < self.start_row || cell.row > self.end_row {
+            return false;
+        }
+        if self.start_row == self.end_row {
+            return cell.col >= self.start_col && cell.col <= self.end_col;
+        }
+        if cell.row == self.start_row {
+            return cell.col >= self.start_col;
+        }
+        if cell.row == self.end_row {
+            return cell.col <= self.end_col;
+        }
+        true
+    }
+}
+
+/// Characters allowed inside a detected URL. Wrapping punctuation such as
+/// quotes or parentheses is stripped after the match, not during it.
+fn is_url_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(ch)
+}
+
+/// Punctuation that closes a sentence rather than a URL.
+fn is_trailing_url_punct(ch: char) -> bool {
+    matches!(
+        ch,
+        '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"'
+    )
+}
+
+/// Plain-text URLs in `text` as (start, end-exclusive) char indices plus the
+/// URL. `www.` matches gain an `https://` prefix at open time so the opener
+/// does not treat them as file paths.
+fn find_urls(text: &str) -> Vec<(usize, usize, String)> {
+    const SCHEMES: [&[char]; 3] = [
+        &['h', 't', 't', 'p', 's', ':', '/', '/'],
+        &['h', 't', 't', 'p', ':', '/', '/'],
+        &['f', 'i', 'l', 'e', ':', '/', '/'],
+    ];
+    const WWW: [char; 4] = ['w', 'w', 'w', '.'];
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let mut prefix_len = 0;
+        let mut bare_www = false;
+        for scheme in SCHEMES {
+            if chars[i..].starts_with(scheme) {
+                prefix_len = scheme.len();
+                break;
+            }
+        }
+        if prefix_len == 0
+            && chars[i..].starts_with(&WWW)
+            && (i == 0 || !chars[i - 1].is_ascii_alphanumeric())
+        {
+            prefix_len = WWW.len();
+            bare_www = true;
+        }
+        if prefix_len == 0 {
+            i += 1;
+            continue;
+        }
+        let mut end = i + prefix_len;
+        while end < chars.len() && is_url_char(chars[end]) {
+            end += 1;
+        }
+        let mut trimmed = end;
+        while trimmed > i + prefix_len && is_trailing_url_punct(chars[trimmed - 1]) {
+            trimmed -= 1;
+        }
+        if trimmed > i + prefix_len {
+            let url: String = chars[i..trimmed].iter().collect();
+            out.push((
+                i,
+                trimmed,
+                if bare_www {
+                    format!("https://{url}")
+                } else {
+                    url
+                },
+            ));
+            i = end.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+fn cell_at_pos(content: Rect, cw: f32, ch: f32, rows: u16, cols: u16, pos: Pos2) -> CellPos {
+    CellPos {
+        row: ((pos.y - content.top()) / ch)
+            .floor()
+            .clamp(0.0, rows.saturating_sub(1) as f32) as u16,
+        col: ((pos.x - content.left()) / cw)
+            .floor()
+            .clamp(0.0, cols.saturating_sub(1) as f32) as u16,
+    }
+}
+
 pub struct Terminal {
     spec: SpawnSpec,
     master: Box<dyn MasterPty + Send>,
@@ -129,6 +246,7 @@ pub struct Terminal {
     selection: Option<(CellPos, CellPos)>,
     last_mouse: Option<CellPos>,
     mouse_button: Option<u8>,
+    context_cell: Option<CellPos>,
     last_input: Instant,
     had_focus: bool,
     ime: String,
@@ -248,6 +366,7 @@ impl Terminal {
             selection: None,
             last_mouse: None,
             mouse_button: None,
+            context_cell: None,
             last_input: Instant::now(),
             had_focus: false,
             ime: String::new(),
@@ -357,10 +476,12 @@ impl Terminal {
     pub fn clear(&mut self) {
         self.parser.process(b"\x1b[3J\x1b[2J\x1b[H");
         self.selection = None;
+        self.protocol.drop_links();
         self.parser.set_scrollback(0);
     }
     pub fn scroll_top(&mut self) {
         self.selection = None;
+        self.protocol.drop_links();
         self.parser.set_scrollback(usize::MAX);
     }
     pub fn scroll_bottom(&mut self) {
@@ -382,6 +503,8 @@ impl Terminal {
             self.parser.set_size(size.0, size.1);
             self.size = size;
             self.selection = None;
+            // Recorded OSC 8 cells no longer line up after a reflow.
+            self.protocol.drop_links();
         }
         Ok(())
     }
@@ -480,6 +603,90 @@ impl Terminal {
             },
         ));
     }
+    /// Raw visible text of one row plus the starting cell of every char, so
+    /// URL spans map back to cells. Wide continuation cells add no chars.
+    fn row_segment(&self, row: u16) -> (String, Vec<u16>) {
+        let screen = self.parser.screen();
+        let mut text = String::new();
+        let mut cols = Vec::new();
+        for col in 0..self.size.1 {
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            for ch in cell.contents().chars() {
+                text.push(ch);
+                cols.push(col);
+            }
+        }
+        (text, cols)
+    }
+    fn row_is_full(&self, row: u16) -> bool {
+        self.size.1 > 0
+            && self
+                .parser
+                .screen()
+                .cell(row, self.size.1 - 1)
+                .is_some_and(|cell| !cell.contents().is_empty())
+    }
+    /// Plain-text URLs covering `row`. A match that runs into the last cell
+    /// of a full row may be wrapped onto the next rows (up to four total), so
+    /// long links stay clickable in narrow windows. Rows are only joined when
+    /// the boundary is glued (both sides URL characters) and the next row
+    /// does not start a fresh URL, so adjacent links never merge.
+    fn url_hits(&self, row: u16) -> Vec<Hyperlink> {
+        const SCHEME_PREFIXES: [&str; 4] = ["https://", "http://", "file://", "www."];
+        let mut text = String::new();
+        let mut map: Vec<(u16, u16)> = Vec::new();
+        let mut current = row;
+        loop {
+            let (segment, cols) = self.row_segment(current);
+            text.push_str(&segment);
+            map.extend(cols.iter().map(|col| (current, *col)));
+            if current - row >= 3 || current + 1 >= self.size.0 {
+                break;
+            }
+            if !self.row_is_full(current) {
+                break;
+            }
+            let (next_text, _) = self.row_segment(current + 1);
+            let glued = text.chars().last().is_some_and(is_url_char)
+                && next_text.chars().next().is_some_and(is_url_char);
+            let fresh_url = SCHEME_PREFIXES
+                .iter()
+                .any(|prefix| next_text.starts_with(prefix));
+            if !glued || fresh_url {
+                break;
+            }
+            current += 1;
+        }
+        find_urls(&text)
+            .into_iter()
+            .filter_map(|(start, end, uri)| {
+                let (start_row, start_col) = map.get(start).copied()?;
+                let (end_row, end_col) = map.get(end.saturating_sub(1)).copied()?;
+                Some(Hyperlink {
+                    uri,
+                    start_row,
+                    start_col,
+                    end_row,
+                    end_col,
+                })
+            })
+            .collect()
+    }
+    /// Clickable link under a cell: OSC 8 spans first, then plain-text URLs
+    /// re-scanned from the live grid.
+    fn hit_link(&self, cell: CellPos) -> Option<Hyperlink> {
+        if let Some(link) = self.protocol.links.iter().find(|link| link.covers(cell)) {
+            return Some(link.clone());
+        }
+        self.url_hits(cell.row)
+            .into_iter()
+            .find(|hit| hit.covers(cell))
+    }
 
     pub fn show(
         &mut self,
@@ -496,7 +703,7 @@ impl Terminal {
             ui.id().with(&self.spec.pane_id),
             Sense::click_and_drag(),
         );
-        if response.clicked() {
+        if response.clicked() || response.secondary_clicked() {
             response.request_focus();
         }
         if focused {
@@ -544,6 +751,18 @@ impl Terminal {
             focused,
             style,
         );
+        // Ctrl+hover underlines the link and offers it for opening. The scan
+        // only runs while Ctrl is held and stays limited to the hovered rows.
+        let hover_link = if ui.input(|i| i.modifiers.ctrl) {
+            ui.input(|i| i.pointer.hover_pos())
+                .filter(|pos| content.contains(*pos))
+                .and_then(|pos| {
+                    let cell = cell_at_pos(content, cell_width, cell_height, rows, cols, pos);
+                    self.hit_link(cell)
+                })
+        } else {
+            None
+        };
         let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
         painter.rect_filled(rect, 0.0, style.background);
         let screen = self.parser.screen();
@@ -598,6 +817,12 @@ impl Terminal {
                         ..Default::default()
                     };
                     if cell.underline() {
+                        format.underline = Stroke::new(1.0_f32, fg);
+                    }
+                    if hover_link
+                        .as_ref()
+                        .is_some_and(|link| link.covers(CellPos { row, col }))
+                    {
                         format.underline = Stroke::new(1.0_f32, fg);
                     }
                     let galley =
@@ -688,7 +913,77 @@ impl Terminal {
         if style.cursor_blink && focused {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
-        response
+        // Right-click menu with clipboard and link actions. It stays away
+        // while the application owns the mouse (plain right-clicks go to
+        // vim-style programs); Shift+right-click still opens it there. Once
+        // open it stays open for the gesture even if modifiers change.
+        let menu_allowed = self.parser.screen().mouse_protocol_mode()
+            == vt100::MouseProtocolMode::None
+            || ui.input(|i| i.modifiers.shift);
+        if menu_allowed || response.context_menu_opened() {
+            let menu_cell = self.context_cell;
+            let menu_ctx = ui.ctx().clone();
+            response.context_menu(|ui| {
+                if let Some(cell) = menu_cell
+                    && let Some(link) = self.hit_link(cell)
+                {
+                    if ui.button("Open Link").clicked() {
+                        if let Err(e) = open::that(&link.uri) {
+                            self.last_error = Some(format!("Could not open link: {e}"));
+                        }
+                        ui.close();
+                    }
+                    if ui.button("Copy Link Address").clicked() {
+                        menu_ctx.copy_text(link.uri);
+                        ui.close();
+                    }
+                    ui.separator();
+                }
+                if ui
+                    .add_enabled(self.selection.is_some(), egui::Button::new("Copy"))
+                    .clicked()
+                {
+                    menu_ctx.copy_text(self.selected_text());
+                    ui.close();
+                }
+                if ui.button("Paste").clicked() {
+                    // The backend delivers clipboard text as a Paste event on
+                    // the next frame, which handle_input pastes when focused.
+                    menu_ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                    ui.close();
+                }
+                if ui.button("Select All").clicked() {
+                    self.select_all();
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Browse Files to Paste…").clicked() {
+                    if let Some(paths) = rfd::FileDialog::new().pick_files() {
+                        let cwd = self.cwd.clone();
+                        let text = paths
+                            .iter()
+                            .map(|path| shell_quote(path, &cwd))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        if let Err(e) = self.paste(&text) {
+                            self.last_error = Some(format!("Could not paste file paths: {e}"));
+                        }
+                    }
+                    ui.close();
+                }
+                if ui.button("Clear Terminal").clicked() {
+                    self.clear();
+                    ui.close();
+                }
+            });
+        }
+        if let Some(link) = hover_link {
+            response
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(format!("Open link (Ctrl+Click):\n{}", link.uri))
+        } else {
+            response
+        }
     }
 
     #[allow(clippy::too_many_arguments)] // The renderer supplies cell geometry for pointer encoding.
@@ -732,14 +1027,7 @@ impl Terminal {
         let cell_at = {
             let rows = self.size.0;
             let cols = self.size.1;
-            move |pos: Pos2| CellPos {
-                row: ((pos.y - content.top()) / ch)
-                    .floor()
-                    .clamp(0.0, rows.saturating_sub(1) as f32) as u16,
-                col: ((pos.x - content.left()) / cw)
-                    .floor()
-                    .clamp(0.0, cols.saturating_sub(1) as f32) as u16,
-            }
+            move |pos: Pos2| cell_at_pos(content, cw, ch, rows, cols, pos)
         };
         for event in events {
             match event {
@@ -862,10 +1150,30 @@ impl Terminal {
                         if !pressed {
                             self.mouse_button = None;
                         }
+                    } else if button == egui::PointerButton::Secondary && pressed {
+                        // Right-click opens the terminal menu (attached in
+                        // show() under the same condition). The application
+                        // owns the button while its mouse protocol is active.
+                        if !mouse_enabled || modifiers.shift {
+                            self.context_cell = Some(cell_at(pos));
+                        }
                     } else if button == egui::PointerButton::Primary {
                         if pressed {
                             let cell = cell_at(pos);
-                            self.selection = Some((cell, cell));
+                            // Ctrl+Click opens the link under the cursor in the
+                            // host browser (which also works for remote panes).
+                            // The application owns the click while its mouse
+                            // protocol is active, so links yield to it there.
+                            if modifiers.ctrl
+                                && !modifiers.shift
+                                && let Some(link) = self.hit_link(cell)
+                            {
+                                if let Err(e) = open::that(&link.uri) {
+                                    self.last_error = Some(format!("Could not open link: {e}"));
+                                }
+                            } else {
+                                self.selection = Some((cell, cell));
+                            }
                         } else if style.copy_on_select {
                             ui.ctx().copy_text(self.selected_text());
                         }
@@ -958,6 +1266,8 @@ impl Terminal {
         if delta == 0 {
             return;
         }
+        // Scrolling shifts visible rows under recorded OSC 8 spans.
+        self.protocol.drop_links();
         let offset = self
             .parser
             .screen()
@@ -1323,6 +1633,29 @@ fn parse_ssh(raw: &str) -> Result<SshPlan> {
 fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
+
+/// Quote a file path dropped from the OS for pasting into the pane: paths
+/// under the pane directory paste as `./relative` form, and quoting only
+/// applies when the text contains whitespace or shell metacharacters.
+pub(crate) fn shell_quote(path: &Path, cwd: &Path) -> String {
+    let text = match path.strip_prefix(cwd) {
+        Ok(relative) if !relative.as_os_str().is_empty() => {
+            format!("./{}", relative.display())
+        }
+        _ => path.display().to_string(),
+    };
+    let safe = !text.is_empty()
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"@%+=:,./-_".contains(&b));
+    if safe {
+        return text;
+    }
+    #[cfg(unix)]
+    return quote(&text);
+    #[cfg(windows)]
+    return format!("\"{}\"", text.replace('"', "'"));
+}
 fn validate_session(session: &str) -> Result<()> {
     if session.is_empty()
         || session.starts_with('-')
@@ -1360,7 +1693,7 @@ fn tmux_bootstrap(
         quote(&format!("={session}:"))
     );
     Ok(format!(
-        "unset TMUX TMUX_PANE; command -v tmux >/dev/null 2>&1 || {{ printf 'bmux: install tmux 3.2 or newer {} to keep sessions running.\\r\\n' >&2; exit 78; }}; {capture}exec tmux -L {socket} -f /dev/null start-server \\; set-option -g history-limit {} \\; set-option -g default-terminal tmux-256color \\; set-option -g status off \\; set-option -g mouse off \\; set-option -g prefix None \\; set-option -g prefix2 None \\; set-option -g user-keys[0] {} \\; bind-key -n User0 kill-session \\; set-option -g terminal-overrides '*:smcup@:rmcup@' \\; set-option -g destroy-unattached off \\; set-option -g window-size latest \\; new-session -A -D -s {}{directory}{inner}",
+        "unset TMUX TMUX_PANE; command -v tmux >/dev/null 2>&1 || {{ printf 'bmux: install tmux 3.2 or newer {} to keep sessions running.\\r\\n' >&2; exit 78; }}; {capture}exec tmux -L {socket} -f /dev/null start-server \\; set-option -ga update-environment ' WAYLAND_DISPLAY XDG_RUNTIME_DIR XDG_CURRENT_DESKTOP XDG_SESSION_TYPE BROWSER' \\; set-option -g history-limit {} \\; set-option -g default-terminal tmux-256color \\; set-option -g status off \\; set-option -g mouse on \\; set-option -g prefix None \\; set-option -g prefix2 None \\; set-option -g user-keys[0] {} \\; bind-key -n User0 kill-session \\; set-option -g terminal-overrides '*:smcup@:rmcup@' \\; set-option -g destroy-unattached off \\; set-option -g window-size latest \\; new-session -A -D -s {}{directory}{inner}",
         if local {
             if cfg!(windows) {
                 "in WSL"
@@ -1637,6 +1970,8 @@ struct Protocol {
     focus_reporting: bool,
     colors: [Color32; 3],
     palette: [Color32; 16],
+    active_link: Option<(String, u16, u16)>,
+    links: Vec<Hyperlink>,
 }
 impl Default for Protocol {
     fn default() -> Self {
@@ -1648,6 +1983,8 @@ impl Default for Protocol {
             focus_reporting: false,
             colors: [style.foreground, style.background, style.cursor],
             palette: style.palette,
+            active_link: None,
+            links: Vec::new(),
         }
     }
 }
@@ -1657,7 +1994,14 @@ impl Protocol {
         let mut parsed = 0;
         for (index, &byte) in bytes.iter().enumerate() {
             match self.state {
-                0 if byte == 27 => self.state = 1,
+                // Feed plain text to the screen as it arrives so cursor queries
+                // (OSC 8 attribution, reports) observe the current position
+                // even when the sequence they belong to completes later.
+                0 if byte == 27 => {
+                    parser.process(&bytes[parsed..index]);
+                    parsed = index;
+                    self.state = 1;
+                }
                 1 => {
                     self.data.clear();
                     self.state = match byte {
@@ -1709,14 +2053,16 @@ impl Protocol {
                     }
                 }
                 3 if byte == 7 => {
-                    self.finish_osc(&mut replies);
+                    let cursor = parser.screen().cursor_position();
+                    self.finish_osc(&mut replies, cursor);
                     self.state = 0;
                 }
                 3 if byte == 27 => self.state = 4,
                 3 => self.data.push(byte),
                 4 => {
                     if byte == b'\\' {
-                        self.finish_osc(&mut replies);
+                        let cursor = parser.screen().cursor_position();
+                        self.finish_osc(&mut replies, cursor);
                     }
                     self.state = 0;
                 }
@@ -1730,7 +2076,7 @@ impl Protocol {
         parser.process(&bytes[parsed..]);
         replies
     }
-    fn finish_osc(&mut self, replies: &mut Vec<Vec<u8>>) {
+    fn finish_osc(&mut self, replies: &mut Vec<Vec<u8>>, cursor: (u16, u16)) {
         let text = String::from_utf8_lossy(&self.data);
         if let Some(url) = text.strip_prefix("7;file://") {
             if let Some(slash) = url.find('/') {
@@ -1743,6 +2089,22 @@ impl Protocol {
                 };
                 if !decoded.contains('\0') {
                     self.cwd = Some(PathBuf::from(decoded));
+                }
+            }
+        } else if let Some(rest) = text.strip_prefix("8;") {
+            // OSC 8 hyperlink: `8;params;URI` opens, `8;;` closes. The URI
+            // itself may contain `;`, so only the first separator counts.
+            if let Some((_, uri)) = rest.split_once(';') {
+                if uri.is_empty() {
+                    if let Some((open_uri, row, col)) = self.active_link.take() {
+                        self.push_link(open_uri, row, col, cursor.0, cursor.1);
+                    }
+                } else if let Some((open_uri, row, col)) =
+                    self.active_link
+                        .replace((uri.to_owned(), cursor.0, cursor.1))
+                {
+                    // A new link without a closing marker ends the previous one.
+                    self.push_link(open_uri, row, col, cursor.0, cursor.1);
                 }
             }
         } else {
@@ -1776,6 +2138,29 @@ impl Protocol {
                 );
             }
         }
+    }
+    fn push_link(
+        &mut self,
+        uri: String,
+        start_row: u16,
+        start_col: u16,
+        end_row: u16,
+        end_col: u16,
+    ) {
+        self.links.push(Hyperlink {
+            uri,
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+        });
+        if self.links.len() > 256 {
+            self.links.drain(..self.links.len() - 256);
+        }
+    }
+    fn drop_links(&mut self) {
+        self.links.clear();
+        self.active_link = None;
     }
 }
 fn percent_decode(text: &str) -> String {
@@ -2514,6 +2899,296 @@ mod tests {
             terminal.selection.is_some(),
             "Uncovered terminal must still accept selection"
         );
+        drop(terminal);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn find_urls_detects_common_forms() {
+        let hits = find_urls("see https://example.com/a?b=c#d and http://x.io/y plus www.t.org/z!");
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].2, "https://example.com/a?b=c#d");
+        assert_eq!(hits[1].2, "http://x.io/y");
+        assert_eq!(hits[2].2, "https://www.t.org/z");
+        let hits = find_urls("(https://example.com).");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].2, "https://example.com");
+        assert!(find_urls("https:// and wwwexample").is_empty());
+        let hits = find_urls("open file:///home/u/my%20file.txt now");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].2, "file:///home/u/my%20file.txt");
+    }
+
+    #[test]
+    fn hyperlink_covers_cells_within_span() {
+        let link = Hyperlink {
+            uri: "https://example.test".into(),
+            start_row: 4,
+            start_col: 6,
+            end_row: 4,
+            end_col: 10,
+        };
+        assert!(link.covers(CellPos { row: 4, col: 8 }));
+        assert!(!link.covers(CellPos { row: 4, col: 5 }));
+        assert!(!link.covers(CellPos { row: 5, col: 8 }));
+        let wrapped = Hyperlink {
+            uri: "https://example.test/long".into(),
+            start_row: 4,
+            start_col: 70,
+            end_row: 6,
+            end_col: 3,
+        };
+        assert!(wrapped.covers(CellPos { row: 4, col: 79 }));
+        assert!(wrapped.covers(CellPos { row: 5, col: 0 }));
+        assert!(wrapped.covers(CellPos { row: 6, col: 3 }));
+        assert!(!wrapped.covers(CellPos { row: 6, col: 4 }));
+        assert!(!wrapped.covers(CellPos { row: 3, col: 79 }));
+    }
+
+    #[test]
+    fn shell_quote_prefers_relative_and_quotes_spaces() {
+        let cwd = Path::new("/home/u/proj");
+        assert_eq!(
+            shell_quote(Path::new("/home/u/proj/src/main.rs"), cwd),
+            "./src/main.rs"
+        );
+        assert_eq!(
+            shell_quote(Path::new("/home/u/proj/my file.txt"), cwd),
+            "'./my file.txt'"
+        );
+        assert_eq!(
+            shell_quote(Path::new("/etc/hostname"), cwd),
+            "/etc/hostname"
+        );
+        assert_eq!(shell_quote(Path::new("/home/u/proj/a;b"), cwd), "'./a;b'");
+    }
+
+    #[test]
+    fn tmux_bootstrap_enables_mouse_and_desktop_env() {
+        let bootstrap = tmux_bootstrap("fixture-1", true, None, "true", 1000).unwrap();
+        assert!(
+            bootstrap.contains("mouse on"),
+            "tmux must forward mouse events; got: {bootstrap}"
+        );
+        assert!(!bootstrap.contains("mouse off"));
+        for variable in ["WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "BROWSER"] {
+            assert!(
+                bootstrap.contains(variable),
+                "tmux must propagate {variable}; got: {bootstrap}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sgr_mouse_press_and_release_reach_shell() {
+        let mut spec = spec();
+        spec.command = Some("printf '\\033[?1000h\\033[?1006hMOUSE_READY\\n'; stty -icanon min 0 time 25; dd bs=1 count=48 2>/dev/null | od -An -tu1; printf 'MOUSE_DONE\\n'".into());
+        let directory = spec.transcript_dir.clone();
+        let ctx = egui::Context::default();
+        let mut terminal = Terminal::spawn(spec, ctx.clone()).unwrap();
+        wait_for(&mut terminal, "MOUSE_READY");
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 500.0));
+        let position = Pos2::new(400.0, 250.0);
+        let draw = |terminal: &mut Terminal, ctx: &egui::Context, events: Vec<egui::Event>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        terminal.show(ui, ui.max_rect(), true, &TerminalStyle::default());
+                    });
+                },
+            );
+        };
+        draw(
+            &mut terminal,
+            &ctx,
+            vec![egui::Event::PointerMoved(position)],
+        );
+        draw(
+            &mut terminal,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+        draw(
+            &mut terminal,
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        wait_for(&mut terminal, "MOUSE_DONE");
+        let bytes: Vec<u8> = terminal
+            .screen_text()
+            .split_whitespace()
+            .filter_map(|part| part.parse().ok())
+            .collect();
+        let sgr = |window: &[u8]| {
+            window.len() >= 5
+                && window[0] == 27
+                && window[1] == 91
+                && window[2] == 60
+                && window[3] == b'0'
+                && window[4] == b';'
+        };
+        assert!(
+            bytes.windows(5).any(sgr),
+            "Missing SGR press/release sequence: {bytes:?}"
+        );
+        assert!(
+            bytes.contains(&77),
+            "Missing SGR press terminator (M): {bytes:?}"
+        );
+        assert!(
+            bytes.contains(&109),
+            "Missing SGR release terminator (m): {bytes:?}"
+        );
+        drop(terminal);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn osc8_sequences_record_spans() {
+        let mut parser = vt100::Parser::new(24, 80, 1000);
+        let mut protocol = Protocol::default();
+        protocol.process(b"visit https://example.com here\r\n", &mut parser);
+        protocol.process(
+            b"\x1b]8;;https://osc8.example/inner\x1b\\LINKTEXT\x1b]8;;\x1b\\\r\n",
+            &mut parser,
+        );
+        assert_eq!(protocol.links.len(), 1, "links: {:?}", protocol.links);
+        let link = &protocol.links[0];
+        assert_eq!(link.uri, "https://osc8.example/inner");
+        assert!(
+            link.covers(CellPos {
+                row: link.start_row,
+                col: link.start_col,
+            }),
+            "span must cover its own start: {link:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn secondary_click_arms_menu_without_selecting() {
+        let mut spec = spec();
+        spec.command = Some("printf 'MENU_READY\\n'; read value".into());
+        let directory = spec.transcript_dir.clone();
+        let ctx = egui::Context::default();
+        let mut terminal = Terminal::spawn(spec, ctx.clone()).unwrap();
+        wait_for(&mut terminal, "MENU_READY");
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0));
+        let position = Pos2::new(200.0, 120.0);
+        let draw = |terminal: &mut Terminal, ctx: &egui::Context, events: Vec<egui::Event>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        terminal.show(ui, ui.max_rect(), true, &TerminalStyle::default());
+                    });
+                },
+            );
+        };
+        draw(
+            &mut terminal,
+            &ctx,
+            vec![egui::Event::PointerMoved(position)],
+        );
+        for pressed in [true, false] {
+            draw(
+                &mut terminal,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Secondary,
+                        pressed,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert!(
+            terminal.selection.is_none(),
+            "Right-click must not start a text selection"
+        );
+        assert!(
+            terminal.context_cell.is_some(),
+            "Right-click must arm the terminal menu"
+        );
+        assert!(
+            egui::Popup::is_any_open(&ctx),
+            "Right-click must open the terminal menu"
+        );
+        drop(terminal);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn osc8_and_printed_urls_resolve_under_cursor() {
+        let mut spec = spec();
+        spec.command = Some("printf 'visit https://example.com/docs?x=1 here\\n'; printf '\\033]8;;https://osc8.example/inner\\033\\\\LINKTEXT\\033]8;;\\033\\\\\\n'; printf 'READY\\n'".into());
+        let directory = spec.transcript_dir.clone();
+        let ctx = egui::Context::default();
+        let mut terminal = Terminal::spawn(spec, ctx.clone()).unwrap();
+        wait_for(&mut terminal, "READY");
+        let text = terminal.screen_text();
+        let url_row = text
+            .lines()
+            .position(|line| line.contains("https://example.com"))
+            .expect("printed URL missing") as u16;
+        let url_col = text
+            .lines()
+            .nth(url_row as usize)
+            .unwrap()
+            .find("https://")
+            .unwrap();
+        // Map the line offset back to a cell: lines here are plain ASCII.
+        let hit = terminal
+            .hit_link(CellPos {
+                row: url_row,
+                col: url_col as u16 + 8,
+            })
+            .expect("printed URL must resolve");
+        assert_eq!(hit.uri, "https://example.com/docs?x=1");
+        let osc_row = text
+            .lines()
+            .position(|line| line.contains("LINKTEXT"))
+            .expect("OSC 8 text missing") as u16;
+        let osc_col = text
+            .lines()
+            .nth(osc_row as usize)
+            .unwrap()
+            .find("LINKTEXT")
+            .unwrap();
+        let hit = terminal
+            .hit_link(CellPos {
+                row: osc_row,
+                col: osc_col as u16 + 2,
+            })
+            .expect("OSC 8 link must resolve");
+        assert_eq!(hit.uri, "https://osc8.example/inner");
         drop(terminal);
         let _ = fs::remove_dir_all(directory);
     }

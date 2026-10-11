@@ -167,8 +167,13 @@ Alt uses all three modifiers.
 | Reconnect pane | Ctrl+Shift+R |
 | Settings | Ctrl+Shift+Comma |
 | Copy selection / paste | Ctrl+Shift+C / Ctrl+Shift+V |
+| Terminal menu (copy/paste/select/clear/link) | Right-click |
+| Open link under cursor | Ctrl+Click |
+| Select terminal text when the app owns the mouse | Shift+Drag |
+| Paste dropped file paths | Drag files into the terminal (X11/Windows) or Right-click → Browse Files to Paste… |
 
-The History viewer filters recorded output by text. **Insert Replay Command**
+The tab strip stays hidden until the pointer reaches the top edge. The History
+viewer filters recorded output by text. **Insert Replay Command**
 types a command into the pane; you review it and press Enter to execute it.
 
 ## Data and themes

@@ -17,6 +17,7 @@ fn main() -> anyhow::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("[bmux]")
         .with_app_id("dev.bmux.app")
+        .with_drag_and_drop(true)
         .with_inner_size(settings.initial_size())
         .with_min_inner_size([640.0, 400.0])
         .with_decorations(false)

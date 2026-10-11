@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::{
     model::{Pane, SplitDirection, SplitNode, State, Store, Tab, Workspace, WorkspaceKind},
     settings::{Settings, ThemeColors},
-    terminal::{CursorShape, SessionKind, SpawnSpec, Terminal, TerminalStyle},
+    terminal::{CursorShape, SessionKind, SpawnSpec, Terminal, TerminalStyle, shell_quote},
 };
 
 #[derive(Serialize, Deserialize)]
@@ -122,6 +122,8 @@ pub struct BmuxApp {
     font_path: String,
     zoom: f32,
     dragging_workspace: Option<Uuid>,
+    navigator_revealed: bool,
+    navigator_band: bool,
     last_metadata: Instant,
     corner_mask: Option<std::sync::Arc<crate::window_shape::CornerMask>>,
 }
@@ -157,6 +159,8 @@ impl BmuxApp {
             font_path: String::new(),
             zoom: 0.0,
             dragging_workspace: None,
+            navigator_revealed: false,
+            navigator_band: false,
             last_metadata: Instant::now(),
             corner_mask,
         };
@@ -606,7 +610,9 @@ impl BmuxApp {
                                     self.actions.push(Action::Settings);
                                 }
                                 if ui.button("Open data folder").clicked() {
-                                    let _ = open::that(self.store.data_dir());
+                                    if let Err(e) = open::that(self.store.data_dir()) {
+                                        self.errors.push(e.to_string());
+                                    }
                                     ui.close();
                                 }
                                 if ui.button("Quit").clicked() {
@@ -913,26 +919,64 @@ impl BmuxApp {
                     resize_throttle_ms: self.settings.resize_throttle_ms.unwrap_or(0.0),
                     ..Default::default()
                 };
-                // Keep navigation in its own row. Overlaying the PTY previously
-                // hid the strip on pointer leave and let terminals consume its clicks.
-                let navigator = Rect::from_min_max(
-                    rect.min,
-                    Pos2::new(rect.right(), (rect.top() + 42.0).min(rect.bottom())),
-                );
-                ui.painter().rect_filled(navigator, 0, colors.background);
-                self.tab_overlay(ui, navigator, &ws, &tab, colors);
-                let terminal_rect =
-                    Rect::from_min_max(Pos2::new(rect.left(), navigator.bottom()), rect.max);
+                // Hover-reveal navigation: the strip stays hidden until the
+                // pointer enters a thin band at the top edge, then floats over
+                // the terminal as glass pills without pushing the grid around
+                // or covering a full row with an opaque bar. Entering the band
+                // with a button held (including the press and release of a
+                // click) never reveals it; only a button-free entry does. An
+                // open popup pins it visible so menus are never orphaned.
+                let eligible = self.settings.show_single_tab
+                    || ws.tabs.len() > 1
+                    || tab.root.panes().len() > 1;
+                let strip_height = 42.0;
+                let reveal_band = 12.0;
+                let hovered = ctx.input(|i| i.pointer.hover_pos());
+                let in_band = hovered.is_some_and(|pos| {
+                    pos.x >= rect.left()
+                        && pos.x <= rect.right()
+                        && pos.y >= rect.top()
+                        && pos.y < rect.top() + reveal_band
+                });
+                let in_strip = hovered.is_some_and(|pos| {
+                    pos.x >= rect.left()
+                        && pos.x <= rect.right()
+                        && pos.y >= rect.top()
+                        && pos.y < rect.top() + strip_height
+                });
+                let pressed = ctx.input(|i| i.pointer.primary_down() || i.pointer.secondary_down());
+                let entered = in_band && !self.navigator_band;
+                let revealed = eligible
+                    && ((in_strip && (self.navigator_revealed || (entered && !pressed)))
+                        || egui::Popup::is_any_open(ctx));
+                self.navigator_revealed = revealed;
+                self.navigator_band = in_band;
                 let mut root = tab.root.clone();
                 self.split_ui(
                     ui,
                     &mut root,
-                    terminal_rect,
+                    rect,
                     tab.focused_pane,
                     &style,
                     colors,
                     !self.modal() && !egui::Popup::is_any_open(ctx),
                 );
+                if revealed {
+                    let navigator = Rect::from_min_max(
+                        rect.min,
+                        Pos2::new(rect.right(), (rect.top() + strip_height).min(rect.bottom())),
+                    );
+                    self.tab_overlay(ui, navigator, &ws, &tab, colors);
+                }
+                if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+                    ui.painter().text(
+                        rect.center_top() + Vec2::new(0.0, 46.0),
+                        Align2::CENTER_TOP,
+                        "Drop files to paste their paths",
+                        FontId::monospace(12.0),
+                        colors.foreground.gamma_multiply(0.75),
+                    );
+                }
                 if let Some(t) = self.tab_mut() {
                     t.root = root;
                 }
@@ -966,7 +1010,7 @@ impl BmuxApp {
                 if let Some(host) = self.hosts.get_mut(&pane.id) {
                     if let Some(term) = host.terminal.as_mut() {
                         let response = term.show(ui, rect, focused && interactive, style);
-                        if response.clicked() && interactive {
+                        if (response.clicked() || response.secondary_clicked()) && interactive {
                             self.actions.push(Action::Focus(pane.id));
                         }
                         if !term.is_alive() {
@@ -2095,6 +2139,31 @@ impl eframe::App for BmuxApp {
         self.toolbar(ctx, &colors);
         self.sidebar(ctx, &colors);
         self.terminal_area(ctx, &colors);
+        // Paste files dropped from the OS into the focused pane, relative
+        // (`./…`) when under its directory, shell-quoted when needed.
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| file.path.clone())
+                .collect()
+        });
+        if !dropped.is_empty()
+            && let Some(id) = self.focus()
+            && let Some(host) = self.hosts.get_mut(&id)
+            && let Some(term) = host.terminal.as_mut()
+        {
+            let cwd = term.cwd();
+            let text = dropped
+                .iter()
+                .map(|path| shell_quote(path, &cwd))
+                .collect::<Vec<_>>()
+                .join(" ");
+            if let Err(e) = term.paste(&text) {
+                self.errors
+                    .push(format!("Could not paste dropped files: {e}"));
+            }
+        }
         self.window_resize_handles(ctx);
         self.dialogs(ctx);
         self.commit_frame_actions(ctx);

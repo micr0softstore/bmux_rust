@@ -19,6 +19,8 @@ fn fixture(directory: &std::path::Path) -> BmuxApp {
         font_path: String::new(),
         zoom: 0.0,
         dragging_workspace: None,
+        navigator_revealed: false,
+        navigator_band: false,
         last_metadata: Instant::now(),
         corner_mask: None,
     }
@@ -232,43 +234,81 @@ fn click_terminal_ui(app: &mut BmuxApp, ctx: &egui::Context, width: f32, positio
     }
 }
 
+fn terminal_surface(output: &egui::FullOutput) -> Option<Rect> {
+    output.shapes.iter().find_map(|shape| {
+        if let egui::Shape::Rect(rect) = &shape.shape {
+            (rect.rect.bottom() == 500.0 && rect.rect.width() == 800.0 && rect.fill.a() > 0)
+                .then_some(rect.rect)
+        } else {
+            None
+        }
+    })
+}
+
 #[test]
-fn navigator_remains_visible_without_hover_and_reserves_terminal_space() {
+fn navigator_hides_until_top_edge_hover_and_floats_without_resizing() {
     let temp = tempfile::tempdir().unwrap();
     let mut app = fixture(temp.path());
     let ctx = egui::Context::default();
     let tab = app.tab().unwrap().id;
-    render_terminal_ui(&mut app, &ctx, 800.0, Vec::new());
-    let original = ctx.read_response(Id::new(("tab", tab))).unwrap().rect;
+    // Hidden without hover: no tab widgets while the terminal keeps the area.
+    let output = render_terminal_ui(&mut app, &ctx, 800.0, Vec::new());
+    assert!(!painted_text(&output).iter().any(|(text, _)| text == ">_ 1"));
+    let hidden_surface =
+        terminal_surface(&output).expect("the terminal surface paints the full area");
+    assert_eq!(hidden_surface.top(), 0.0);
+    // Hovering the top edge floats the strip over the grid without moving it.
     let output = render_terminal_ui(
         &mut app,
         &ctx,
         800.0,
-        vec![egui::Event::PointerMoved(Pos2::new(400.0, 300.0))],
+        vec![egui::Event::PointerMoved(Pos2::new(400.0, 5.0))],
     );
     assert!(painted_text(&output).iter().any(|(text, _)| text == ">_ 1"));
+    let tab_rect = ctx.read_response(Id::new(("tab", tab))).unwrap().rect;
+    assert!(tab_rect.bottom() <= 42.0);
+    let revealed_surface =
+        terminal_surface(&output).expect("the terminal surface keeps the full area");
+    assert_eq!(hidden_surface, revealed_surface);
+    // Leaving hides it again.
     render_terminal_ui(&mut app, &ctx, 800.0, vec![egui::Event::PointerGone]);
     let output = render_terminal_ui(&mut app, &ctx, 800.0, Vec::new());
-    assert!(painted_text(&output).iter().any(|(text, _)| text == ">_ 1"));
-    let current = ctx.read_response(Id::new(("tab", tab))).unwrap().rect;
-    assert_eq!(
-        original, current,
-        "hover must not move the navigation or PTY grid"
+    assert!(!painted_text(&output).iter().any(|(text, _)| text == ">_ 1"));
+    let current = terminal_surface(&output).expect("the terminal surface paints the full area");
+    assert_eq!(hidden_surface, current);
+    // A left-click in the band must not reveal the strip: press and release
+    // arrive as separate frames, and neither may arm it.
+    for pressed in [true, false] {
+        render_terminal_ui(
+            &mut app,
+            &ctx,
+            800.0,
+            vec![
+                egui::Event::PointerMoved(Pos2::new(400.0, 5.0)),
+                egui::Event::PointerButton {
+                    pos: Pos2::new(400.0, 5.0),
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+    }
+    let output = render_terminal_ui(&mut app, &ctx, 800.0, Vec::new());
+    assert!(
+        !painted_text(&output).iter().any(|(text, _)| text == ">_ 1"),
+        "clicking must never reveal the navigator"
     );
-    let terminal_background = output
-        .shapes
-        .iter()
-        .find_map(|shape| {
-            if let egui::Shape::Rect(rect) = &shape.shape {
-                (rect.rect.bottom() == 500.0 && rect.rect.width() == 800.0 && rect.fill.a() > 0)
-                    .then_some(rect.rect)
-            } else {
-                None
-            }
-        })
-        .expect("the terminal surface is painted independently of the navigator");
-    assert!(terminal_background.top() >= current.bottom());
-    assert_eq!(terminal_background.top(), 42.0);
+    // Hover entry still reveals afterwards: leave and re-enter the band.
+    render_terminal_ui(&mut app, &ctx, 800.0, vec![egui::Event::PointerGone]);
+    render_terminal_ui(&mut app, &ctx, 800.0, Vec::new());
+    let output = render_terminal_ui(
+        &mut app,
+        &ctx,
+        800.0,
+        vec![egui::Event::PointerMoved(Pos2::new(400.0, 5.0))],
+    );
+    assert!(painted_text(&output).iter().any(|(text, _)| text == ">_ 1"));
 }
 
 #[test]
@@ -284,7 +324,13 @@ fn split_count_and_pane_picker_follow_the_active_tree_and_focus_clicked_pane() {
     assert_ne!(first, second);
     assert_eq!(app.workspace().unwrap().tabs.len(), 1);
     render_terminal_ui(&mut app, &ctx, 800.0, Vec::new());
-    let output = render_terminal_ui(&mut app, &ctx, 800.0, Vec::new());
+    // The pane picker lives in the hover-revealed strip.
+    let output = render_terminal_ui(
+        &mut app,
+        &ctx,
+        800.0,
+        vec![egui::Event::PointerMoved(Pos2::new(400.0, 5.0))],
+    );
     let texts = painted_text(&output);
     assert!(texts.iter().any(|(text, _)| text == ">_ 1 · 2 panes"));
     let picker = texts
@@ -330,7 +376,12 @@ fn overflow_navigator_reveals_new_and_keyboard_selected_tabs_after_resizing() {
     let last = app.tab().unwrap().id;
     for width in [1000.0, 420.0, 220.0, 850.0] {
         for _ in 0..3 {
-            render_terminal_ui(&mut app, &ctx, width, Vec::new());
+            render_terminal_ui(
+                &mut app,
+                &ctx,
+                width,
+                vec![egui::Event::PointerMoved(Pos2::new(60.0, 5.0))],
+            );
         }
         let response = ctx.read_response(Id::new(("tab", last))).unwrap();
         assert!(
@@ -343,7 +394,12 @@ fn overflow_navigator_reveals_new_and_keyboard_selected_tabs_after_resizing() {
     app.actions.push(Action::SelectTab(first));
     app.process_actions();
     for _ in 0..3 {
-        render_terminal_ui(&mut app, &ctx, 420.0, Vec::new());
+        render_terminal_ui(
+            &mut app,
+            &ctx,
+            420.0,
+            vec![egui::Event::PointerMoved(Pos2::new(60.0, 5.0))],
+        );
     }
     let first_response = ctx.read_response(Id::new(("tab", first))).unwrap();
     assert!(first_response.interact_rect.width() > 30.0);

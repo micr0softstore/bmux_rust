@@ -20,8 +20,10 @@ Rust code in `src/`, and the Swift sources are no longer kept in this checkout.
 The interface follows the source's warm near-black Srcery background,
 parchment foreground, orange accent, compact sidebar rows with color strips,
 per-pane folder labels, pill-shaped tab bar, pane controls, hairline split
-dividers, and eight settings sections. The navigator now reserves its own row
-and stays visible without hovering. A split tab displays its pane count and
+dividers, and eight settings sections. The navigator stays hidden until the
+pointer enters a thin band at the top edge — clicks alone never reveal it —
+then floats over the terminal as glass pills without pushing the grid around
+or covering a full row with an opaque bar. A split tab displays its pane count and
 a picker for every pane; split panes remain grouped in their original tab.
 Long tab lists scroll to the active tab, with a compact overflow menu when
 space is tight. Light themes also recolor the application chrome.
@@ -55,13 +57,29 @@ icon.
 The terminal engine is a portable VT screen implementation rather than
 libghostty. Normal interactive shells and ANSI terminal programs are the
 target. This is not a complete reimplementation of every Ghostty extension.
-Kitty graphics, Sixel image output, clickable OSC 8 hyperlinks, Ghostty shader configuration, and
+Kitty graphics, Sixel image output, Ghostty shader configuration, and
 Ghostty-specific keybinding/configuration directives are not supported.
 Font ligature shaping and full bidirectional-script terminal shaping are not
 equivalent to Ghostty. Background blur is unsupported by the portable renderer.
 Remote directory and command labels use tmux metadata when batch-mode SSH
 authentication is available, with shell OSC 7 directory notifications as a
 fallback. Keep these limitations in mind for specialized TUIs.
+
+Pointer input follows the application: clicks, drags and wheel events are
+encoded with the active mouse protocol (including SGR), so vim-style programs
+receive left clicks. Tmux-backed sessions run with tmux mouse support enabled
+for the same reason, and propagate the Wayland/display and browser environment
+so `xdg-open` works inside them; Shift+click always selects terminal-side
+text instead. Ctrl+Click opens the hyperlink or URL under the cursor
+(OSC 8 links and plain-text URLs, including links wrapped across rows) in the
+host browser, which also works for remote panes. Files dropped from the OS
+paste their paths into the focused pane, relative (`./…`) when under its
+directory. Window-system drag-and-drop only reaches the app on X11 and
+Windows: the underlying toolkit does not deliver file drops on Wayland, so
+the terminal menu also offers “Browse Files to Paste…” as a file-picker path
+that works everywhere. Right-click opens the terminal menu (copy, paste,
+select all, link actions, file picker, clear); while a mouse-aware program
+owns the pointer, use Shift+right-click for the menu instead.
 
 Raw Ghostty configuration cannot be forwarded to a Ghostty engine in this
 build. The Advanced settings panel documents the subset the Rust port
