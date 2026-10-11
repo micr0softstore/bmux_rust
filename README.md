@@ -55,7 +55,7 @@ To build an installable Debian/Ubuntu package (native amd64 or arm64):
 ```sh
 sudo apt-get install dpkg-dev binutils python3 python3-pil
 ./packaging/build-deb.sh
-sudo apt install ./dist/bmux_1.2.3-1_amd64.deb
+sudo apt install ./dist/bmux_1.2.5-1_amd64.deb
 ```
 
 Use the filename printed by the script for your version and architecture.
@@ -131,9 +131,10 @@ Use the **+** menu to create a local, local tmux, or SSH workspace. Each
 workspace has its own tabs, nested splits, selected pane, color, and directory.
 Workspace context menus provide rename, duplicate, reorder, and deletion.
 
-Ordinary local shells restart when the application is reopened and replay a
-bounded tail of their transcript. Their original processes do not survive
-quitting. Tmux workspaces reattach to persistent sessions; quitting detaches
+Ordinary local shells restart when the application is reopened with a fresh,
+empty screen; scrollback starts empty too. Their original processes do not
+survive quitting. Tmux workspaces reattach to persistent sessions and likewise
+reopen with a fresh screen; quitting detaches
 the application, while explicitly closing a pane ends that pane's session.
 Tmux persistence survives application restarts, not machine reboots.
 

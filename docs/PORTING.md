@@ -87,9 +87,12 @@ understands; unsupported options must not be treated as working merely
 because the settings text is preserved.
 
 Persistence has the same distinction as the original: a regular local shell
-is restarted with a transcript replay; a tmux session preserves live
-processes. Transcript replay restores recorded display history, not the
-original process, shell variables, or its exact terminal parser state.
+is restarted, and a tmux session preserves live processes. Reopened panes
+always start with a fresh, empty screen and empty scrollback — no transcript
+replay and no tmux capture dump — while workspace trees, splits, focused
+panes and working directories are restored. Transcripts are still recorded
+per pane for the History viewer; clearing a terminal wipes its screen and
+scrollback completely.
 Scrollback capacity is represented as a line budget in the Rust parser,
 so a megabyte setting is an estimate rather than Ghostty's exact allocation.
 

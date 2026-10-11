@@ -33,7 +33,6 @@ pub struct SpawnSpec {
     pub kind: SessionKind,
     pub transcript_dir: PathBuf,
     pub transcript_max_mb: usize,
-    pub restore_tail_kb: usize,
     pub scrollback_lines: usize,
 }
 
@@ -299,18 +298,12 @@ impl Terminal {
         retry_cleanup(spec.transcript_dir.join("pending-close"));
         let transcript = spec.transcript_dir.join(format!("{}.ts", spec.pane_id));
         let max_bytes = spec.transcript_max_mb.max(1).saturating_mul(1024 * 1024) as u64;
-        let mut parser =
-            vt100::Parser::new(rows, cols, spec.scrollback_lines.clamp(100, 1_000_000));
-        if matches!(spec.kind, SessionKind::Local) && spec.restore_tail_kb > 0 {
-            let restored = read_tail(&transcript, spec.restore_tail_kb.min(16 * 1024) * 1024);
-            if !restored.is_empty() {
-                parser.process(&restored);
-                // Recordings cannot carry an alternate-screen/input mode into a fresh shell.
-                parser.process(
-                    b"\x1b[?1049l\x1b[?1l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[0m\r\n",
-                );
-            }
-        }
+        let parser = vt100::Parser::new(rows, cols, spec.scrollback_lines.clamp(100, 1_000_000));
+        // Reopened panes start with a fresh, empty grid: no transcript replay
+        // (raw replays corrupt the screen with foreign-width wraps and
+        // mid-stream cursor motions) and no tmux capture dump (see
+        // tmux_bootstrap). Structure, directories and live sessions persist;
+        // history stays available through the transcript files and viewer.
         let mut recorder = Recorder::new(transcript.clone(), max_bytes)?;
         let pair = portable_pty::native_pty_system()
             .openpty(PtySize {
@@ -474,8 +467,50 @@ impl Terminal {
         }
     }
     pub fn clear(&mut self) {
-        self.parser.process(b"\x1b[3J\x1b[2J\x1b[H");
+        // vt100 has no scrollback erase (`3J` is unhandled), so rebuild the
+        // grid: screen and scrollback are truly empty afterwards, including
+        // for scroll-up. The live input modes are re-applied so mouse-aware
+        // programs keep working across a clear.
+        let screen = self.parser.screen();
+        let alternate = screen.alternate_screen();
+        let bracketed = screen.bracketed_paste();
+        let mouse_mode = screen.mouse_protocol_mode();
+        let mouse_encoding = screen.mouse_protocol_encoding();
+        let application_cursor = screen.application_cursor();
+        let application_keypad = screen.application_keypad();
+        let hide_cursor = screen.hide_cursor();
+        let (rows, cols) = self.size;
+        self.parser =
+            vt100::Parser::new(rows, cols, self.spec.scrollback_lines.clamp(100, 1_000_000));
+        if alternate {
+            self.parser.process(b"\x1b[?1049h");
+        }
+        if bracketed {
+            self.parser.process(b"\x1b[?2004h");
+        }
+        match mouse_mode {
+            vt100::MouseProtocolMode::Press => self.parser.process(b"\x1b[?9h"),
+            vt100::MouseProtocolMode::PressRelease => self.parser.process(b"\x1b[?1000h"),
+            vt100::MouseProtocolMode::ButtonMotion => self.parser.process(b"\x1b[?1002h"),
+            vt100::MouseProtocolMode::AnyMotion => self.parser.process(b"\x1b[?1003h"),
+            vt100::MouseProtocolMode::None => {}
+        }
+        match mouse_encoding {
+            vt100::MouseProtocolEncoding::Utf8 => self.parser.process(b"\x1b[?1005h"),
+            vt100::MouseProtocolEncoding::Sgr => self.parser.process(b"\x1b[?1006h"),
+            _ => {}
+        }
+        if application_cursor {
+            self.parser.process(b"\x1b[?1h");
+        }
+        if application_keypad {
+            self.parser.process(b"\x1b=");
+        }
+        if hide_cursor {
+            self.parser.process(b"\x1b[?25l");
+        }
         self.selection = None;
+        self.scroll_fraction = 0.0;
         self.protocol.drop_links();
         self.parser.set_scrollback(0);
     }
@@ -697,7 +732,6 @@ impl Terminal {
     ) -> Response {
         self.protocol.colors = [style.foreground, style.background, style.cursor];
         self.protocol.palette = style.palette;
-        self.poll();
         let response = ui.interact(
             rect,
             ui.id().with(&self.spec.pane_id),
@@ -742,6 +776,7 @@ impl Terminal {
             let _ = self.write(if focused { b"\x1b[I" } else { b"\x1b[O" });
         }
         self.had_focus = focused;
+        self.poll();
         self.handle_input(
             ui,
             &response,
@@ -1687,13 +1722,8 @@ fn tmux_bootstrap(
     } else {
         format!(" {}", quote(inner))
     };
-    let capture = format!(
-        "tmux -L {socket} capture-pane -p -e -S -{} -E -1 -t {} 2>/dev/null || true; ",
-        scrollback.clamp(100, 1_000_000),
-        quote(&format!("={session}:"))
-    );
     Ok(format!(
-        "unset TMUX TMUX_PANE; command -v tmux >/dev/null 2>&1 || {{ printf 'bmux: install tmux 3.2 or newer {} to keep sessions running.\\r\\n' >&2; exit 78; }}; {capture}exec tmux -L {socket} -f /dev/null start-server \\; set-option -ga update-environment ' WAYLAND_DISPLAY XDG_RUNTIME_DIR XDG_CURRENT_DESKTOP XDG_SESSION_TYPE BROWSER' \\; set-option -g history-limit {} \\; set-option -g default-terminal tmux-256color \\; set-option -g status off \\; set-option -g mouse on \\; set-option -g prefix None \\; set-option -g prefix2 None \\; set-option -g user-keys[0] {} \\; bind-key -n User0 kill-session \\; set-option -g terminal-overrides '*:smcup@:rmcup@' \\; set-option -g destroy-unattached off \\; set-option -g window-size latest \\; new-session -A -D -s {}{directory}{inner}",
+        "unset TMUX TMUX_PANE; command -v tmux >/dev/null 2>&1 || {{ printf 'bmux: install tmux 3.2 or newer {} to keep sessions running.\\r\\n' >&2; exit 78; }}; exec tmux -L {socket} -f /dev/null start-server \\; set-option -ga update-environment ' WAYLAND_DISPLAY XDG_RUNTIME_DIR XDG_CURRENT_DESKTOP XDG_SESSION_TYPE BROWSER' \\; set-option -g history-limit {} \\; set-option -g default-terminal tmux-256color \\; set-option -g status off \\; set-option -g mouse on \\; set-option -g prefix None \\; set-option -g prefix2 None \\; set-option -g user-keys[0] {} \\; bind-key -n User0 kill-session \\; set-option -g terminal-overrides '*:smcup@:rmcup@' \\; set-option -g destroy-unattached off \\; set-option -g window-size latest \\; new-session -A -D -s {}{directory}{inner}",
         if local {
             if cfg!(windows) {
                 "in WSL"
@@ -2432,7 +2462,6 @@ mod tests {
             kind: SessionKind::Local,
             transcript_dir: std::env::temp_dir().join(format!("bmux-{id}")),
             transcript_max_mb: 1,
-            restore_tail_kb: 0,
             scrollback_lines: 1000,
         }
     }
@@ -2588,9 +2617,10 @@ mod tests {
     }
 
     #[test]
-    fn persistent_bootstrap_preserves_history_and_forwards_ctrl_b() {
+    fn persistent_bootstrap_starts_fresh_and_forwards_ctrl_b() {
         let script = tmux_bootstrap("test-session", false, None, "", 5000).unwrap();
-        assert!(script.contains("capture-pane -p -e -S -5000 -E -1"));
+        // Reattached sessions start with a fresh grid: no capture dump.
+        assert!(!script.contains("capture-pane"));
         assert!(script.contains("smcup@:rmcup@"));
         assert!(script.contains("prefix None"));
     }
@@ -2673,10 +2703,12 @@ mod tests {
             .write(b"printf 'AFTER:%s\\n' \"$BMUX_TEST_PERSIST\"\n")
             .unwrap();
         wait_for(&mut restored, "AFTER:survived");
+        // The live session survives (env var intact), but the grid restarts
+        // fresh: no recents, even in scrollback.
         restored.scroll_top();
         assert!(
-            restored.screen_text().contains("HISTORY_MARK_0"),
-            "History missing after reattach: {:?}",
+            !restored.screen_text().contains("HISTORY_MARK_0"),
+            "reattached grid must not replay recents: {:?}",
             restored.screen_text()
         );
         restored.scroll_bottom();
@@ -2920,6 +2952,40 @@ mod tests {
     }
 
     #[test]
+    fn clear_empties_screen_and_scrollback_and_keeps_modes() {
+        let mut parser = vt100::Parser::new(24, 80, 1000);
+        parser.process(b"first\nsecond\n\x1b[?2004h\x1b[?1000h\x1b[?1006h\x1b[?1h");
+        // Build a terminal around the parser without spawning anything.
+        let mut spec = spec();
+        spec.command = Some("true".into());
+        let directory = spec.transcript_dir.clone();
+        let ctx = egui::Context::default();
+        let mut terminal = Terminal::spawn(spec, ctx).unwrap();
+        terminal.parser = parser;
+        terminal.protocol.drop_links();
+        assert!(terminal.parser.screen().bracketed_paste());
+        assert_ne!(
+            terminal.parser.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None
+        );
+        terminal.clear();
+        assert_eq!(terminal.parser.screen().contents().trim(), "");
+        assert_eq!(terminal.parser.screen().scrollback(), 0);
+        terminal.scroll_top();
+        assert_eq!(terminal.parser.screen().contents().trim(), "");
+        terminal.scroll_bottom();
+        // Live input modes survive the clear.
+        assert!(terminal.parser.screen().bracketed_paste());
+        assert_ne!(
+            terminal.parser.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None
+        );
+        assert!(terminal.parser.screen().application_cursor());
+        drop(terminal);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn hyperlink_covers_cells_within_span() {
         let link = Hyperlink {
             uri: "https://example.test".into(),
@@ -3140,6 +3206,59 @@ mod tests {
             egui::Popup::is_any_open(&ctx),
             "Right-click must open the terminal menu"
         );
+        drop(terminal);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reopened_pane_starts_fresh_without_recents() {
+        let mut spec = spec();
+        spec.command = Some("printf 'LIVE\\n'".into());
+        // A previous session's output sits in the transcript file, but the
+        // reopened grid must not replay it: fresh look, empty scrollback.
+        fs::create_dir_all(&spec.transcript_dir).unwrap();
+        fs::write(
+            spec.transcript_dir.join(format!("{}.ts", spec.pane_id)),
+            b"\x1b[1;32mOLD-OUTPUT\x1b[0m ok\r\nsecond old line\n",
+        )
+        .unwrap();
+        let directory = spec.transcript_dir.clone();
+        let ctx = egui::Context::default();
+        let mut terminal = Terminal::spawn(spec, ctx.clone()).unwrap();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 500.0));
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    terminal.show(ui, ui.max_rect(), true, &TerminalStyle::default());
+                });
+            },
+        );
+        wait_for(&mut terminal, "LIVE");
+        let text = terminal.screen_text();
+        assert!(text.contains("LIVE"), "fresh output missing: {text:?}");
+        for stale in ["OLD-OUTPUT", "second old line"] {
+            assert!(
+                !text.contains(stale),
+                "reopened grid replayed recents: {text:?}"
+            );
+        }
+        // Scrollback holds no recents either: scrolled to the top, only
+        // fresh output may show (the offset clamps when barely anything
+        // scrolled yet), never stale lines.
+        terminal.scroll_top();
+        let scrolled = terminal.screen_text();
+        for stale in ["OLD-OUTPUT", "second old line"] {
+            assert!(
+                !scrolled.contains(stale),
+                "scrollback replayed recents: {scrolled:?}"
+            );
+        }
+        terminal.scroll_bottom();
         drop(terminal);
         let _ = fs::remove_dir_all(directory);
     }

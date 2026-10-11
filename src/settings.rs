@@ -81,8 +81,6 @@ pub struct Settings {
     pub relaunch_after_seconds: f64,
     #[serde(alias = "transcriptMaxMB")]
     pub transcript_max_mb: u32,
-    #[serde(alias = "restoreTailKB")]
-    pub restore_tail_kb: u32,
     #[serde(alias = "extraConfig")]
     pub extra_config: String,
     #[serde(alias = "defaultWidth")]
@@ -139,7 +137,6 @@ impl Default for Settings {
             auto_relaunch: true,
             relaunch_after_seconds: 5.0,
             transcript_max_mb: 8,
-            restore_tail_kb: 128,
             extra_config: String::new(),
             default_width: 1280.0,
             default_height: 800.0,
@@ -354,7 +351,6 @@ impl Settings {
             5.0
         };
         self.transcript_max_mb = self.transcript_max_mb.clamp(1, 128);
-        self.restore_tail_kb = self.restore_tail_kb.clamp(16, 2048);
         self.default_width = clamp(self.default_width, 640.0..=4096.0, 1280.0);
         self.default_height = clamp(self.default_height, 400.0..=2160.0, 800.0);
         self.padding_x = self.padding_x.min(32);
@@ -777,11 +773,6 @@ impl Settings {
         group(ui, "History", |ui| {
             ui.add(
                 egui::Slider::new(&mut self.transcript_max_mb, 1..=128).text("Transcript cap (MB)"),
-            );
-            ui.add(
-                egui::Slider::new(&mut self.restore_tail_kb, 16..=2048)
-                    .step_by(16.0)
-                    .text("Restore tail (KB)"),
             );
             note(
                 ui,

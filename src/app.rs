@@ -231,6 +231,13 @@ impl BmuxApp {
     fn ensure_hosts(&mut self, ctx: &egui::Context) {
         crate::terminal::service_cleanup(&self.store.transcript_dir());
         for ws in &self.state.workspaces {
+            // Mirror terminal_area's tab pick: only the visible tab paints.
+            let visible = ws
+                .tabs
+                .iter()
+                .find(|t| t.id == ws.active_tab)
+                .or(ws.tabs.first())
+                .map(|t| t.id);
             for tab in &ws.tabs {
                 for pane in tab.root.panes() {
                     let id = pane.id;
@@ -267,6 +274,14 @@ impl BmuxApp {
                     if host.terminal.is_some() || host.error.is_some() {
                         continue;
                     }
+                    // Spawn only for the visible tab: its first paint sizes
+                    // the PTY in the same frame, so neither live output nor a
+                    // tmux capture dump can land on the 24x80 spawn grid and
+                    // wrap. Hidden tabs spawn on first view instead of
+                    // recording garbage they can never reflow.
+                    if Some(tab.id) != visible {
+                        continue;
+                    }
                     let kind = if ws.kind == WorkspaceKind::Ssh {
                         SessionKind::Ssh {
                             command: ws.ssh_command.clone(),
@@ -292,7 +307,6 @@ impl BmuxApp {
                         kind,
                         transcript_dir: self.store.transcript_dir(),
                         transcript_max_mb: self.settings.transcript_max_mb as usize,
-                        restore_tail_kb: self.settings.restore_tail_kb as usize,
                         scrollback_lines: (self.settings.scrollback_mb.unwrap_or(10) as usize
                             * 1024)
                             .clamp(1024, 200_000),
@@ -1081,9 +1095,11 @@ impl BmuxApp {
                     .ctx()
                     .data(|data| data.get_temp::<bool>(menu_key).unwrap_or(false));
                 if (hovered || menu_open) && !self.modal() {
+                    // The glass and the button share one centered box so the
+                    // glyph cannot drift out of its pill.
                     let actions_rect = Rect::from_min_size(
-                        rect.right_bottom() - Vec2::new(40.0, 34.0),
-                        Vec2::new(34.0, 28.0),
+                        rect.right_bottom() - Vec2::new(48.0, 38.0),
+                        Vec2::new(42.0, 32.0),
                     );
                     crate::glass::paint_surface(ui.painter(), actions_rect, colors, 10, true);
                     ui.scope_builder(
@@ -1091,33 +1107,38 @@ impl BmuxApp {
                             .id_salt(("pane-actions", pane.id))
                             .max_rect(actions_rect),
                         |ui| {
-                            let menu = ui.menu_button("···", |ui| {
-                                if ui.button("Split right").clicked() {
-                                    self.actions
-                                        .push(Action::Split(pane.id, SplitDirection::SideBySide));
-                                    ui.close();
-                                }
-                                if ui.button("Split down").clicked() {
-                                    self.actions
-                                        .push(Action::Split(pane.id, SplitDirection::Stacked));
-                                    ui.close();
-                                }
-                                ui.separator();
-                                if ui.button("View history").clicked() {
-                                    self.actions.push(Action::History(pane.id));
-                                    ui.close();
-                                }
-                                if ui.button("Reconnect").clicked() {
-                                    self.actions.push(Action::Reconnect(pane.id));
-                                    ui.close();
-                                }
-                                if ui.button("Close pane").clicked() {
-                                    self.actions.push(Action::ClosePane(pane.id));
-                                    ui.close();
-                                }
+                            ui.centered_and_justified(|ui| {
+                                let menu = ui.menu_button("···", |ui| {
+                                    if ui.button("Split right").clicked() {
+                                        self.actions.push(Action::Split(
+                                            pane.id,
+                                            SplitDirection::SideBySide,
+                                        ));
+                                        ui.close();
+                                    }
+                                    if ui.button("Split down").clicked() {
+                                        self.actions
+                                            .push(Action::Split(pane.id, SplitDirection::Stacked));
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui.button("View history").clicked() {
+                                        self.actions.push(Action::History(pane.id));
+                                        ui.close();
+                                    }
+                                    if ui.button("Reconnect").clicked() {
+                                        self.actions.push(Action::Reconnect(pane.id));
+                                        ui.close();
+                                    }
+                                    if ui.button("Close pane").clicked() {
+                                        self.actions.push(Action::ClosePane(pane.id));
+                                        ui.close();
+                                    }
+                                });
+                                ui.ctx().data_mut(|data| {
+                                    data.insert_temp(menu_key, menu.inner.is_some())
+                                });
                             });
-                            ui.ctx()
-                                .data_mut(|data| data.insert_temp(menu_key, menu.inner.is_some()));
                         },
                     );
                 }
@@ -1210,9 +1231,16 @@ impl BmuxApp {
                 .sum::<f32>()
                 + 4.0 * ws.tabs.len().saturating_sub(1) as f32
                 + 6.0;
+            let track_width = natural_width.min(track_space.width());
+            // Center the strip on the terminal view, clamped so it never
+            // slides out of its track or under the controls on narrow views.
+            let center_x = rect.center().x.clamp(
+                track_space.left() + track_width / 2.0,
+                track_space.right() - track_width / 2.0,
+            );
             let track_rect = Rect::from_center_size(
-                track_space.center(),
-                Vec2::new(natural_width.min(track_space.width()), track_space.height()),
+                Pos2::new(center_x, track_space.center().y),
+                Vec2::new(track_width, track_space.height()),
             );
             crate::glass::paint_surface(ui.painter(), track_rect, colors, 13, true);
             let scroll_key = Id::new(("tab-scroll-selection", ws.id));
